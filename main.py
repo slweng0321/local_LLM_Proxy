@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import uvicorn
 
-from .app_state import app
+from local_pipeline.api_admin import router as admin_router
+from local_pipeline.api_chat import router as chat_router
+from local_pipeline.app_state import app
 
-# 匯入路由模組以完成 route registration
-from . import api_admin as _api_admin  # noqa: F401,E402
-from . import api_chat as _api_chat  # noqa: F401,E402
+app.include_router(chat_router)
+app.include_router(admin_router)
 
 
 def run() -> None:

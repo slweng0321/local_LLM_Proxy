@@ -33,18 +33,8 @@ def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
 
 
-def _has_apply_errors(result: dict[str, Any] | None) -> bool:
-    if not isinstance(result, dict):
-        return True
-    if result.get("errors"):
-        return True
-    precheck = result.get("precheck")
-    if isinstance(precheck, dict) and not precheck.get("ok", True):
-        return True
-    return False
-
-
-def _models_payload() -> dict[str, Any]:
+@router.get("/v1/models")
+async def list_models() -> dict[str, Any]:
     return {
         "object": "list",
         "data": [
@@ -76,74 +66,64 @@ def _models_payload() -> dict[str, Any]:
     }
 
 
-@router.get("/v1/models")
-async def list_models() -> dict[str, Any]:
-    return _models_payload()
-
-
 @router.post("/admin/unload")
-async def admin_unload(request: Request) -> JSONResponse | dict[str, Any]:
+async def admin_unload(request: Request):
     body = await request.json()
-    model = str(body.get("model", "")).strip()
+    model = body.get("model")
     if not model:
         return _error("model is required", 400)
 
-    unload_model(model)
-    return {"ok": True, "model": model}
+    unload_model(str(model))
+    return {"ok": True, "model": str(model)}
 
 
 @router.post("/admin/apply")
-async def admin_apply(request: Request) -> JSONResponse | dict[str, Any]:
+async def admin_apply(request: Request):
     body = await request.json()
-    task_id = str(body.get("task_id", "")).strip()
+    task_id = body.get("task_id")
     if not task_id:
         return _error("task_id is required", 400)
 
-    payload = load_task_payload(task_id)
+    payload = load_task_payload(str(task_id))
     if not payload:
         return _error(f"task {task_id} not found", 404)
 
     final_files = payload.get("final_files", [])
-    if not isinstance(final_files, list) or not final_files:
-        return _error(f"task {task_id} has no final_files to apply", 400)
-
     repo_root = Path(payload.get("repo_root", ".")).resolve()
-    result = apply_patches(repo_root, task_id, final_files, apply_mode="apply")
 
+    result = apply_patches(
+        repo_root,
+        str(task_id),
+        final_files,
+        apply_mode="apply",
+    )
     payload["apply_mode"] = "apply"
     payload["apply_result"] = result
-    payload["status"] = "apply_failed" if _has_apply_errors(result) else "applied"
-    update_task_payload(task_id, payload)
-
-    if _has_apply_errors(result):
-        return JSONResponse(result, status_code=400)
+    payload["status"] = "applied"
+    update_task_payload(str(task_id), payload)
     return result
 
 
 @router.post("/admin/rollback")
-async def admin_rollback(request: Request) -> JSONResponse | dict[str, Any]:
+async def admin_rollback(request: Request):
     body = await request.json()
-    task_id = str(body.get("task_id", "")).strip()
+    task_id = body.get("task_id")
     if not task_id:
         return _error("task_id is required", 400)
 
-    payload = load_task_payload(task_id)
+    payload = load_task_payload(str(task_id))
     repo_root = Path(payload.get("repo_root", ".")).resolve() if payload else WORKSPACE_ROOT
 
-    result = rollback_task(task_id, repo_root)
-
+    result = rollback_task(str(task_id), repo_root)
     if payload:
-        payload["status"] = "rollback_failed" if result.get("errors") else "rolled_back"
-        payload["rollback_result"] = result
-        update_task_payload(task_id, payload)
+        payload["status"] = "rolled_back"
+        update_task_payload(str(task_id), payload)
 
-    if result.get("errors"):
-        return JSONResponse(result, status_code=400)
     return result
 
 
 @router.get("/admin/task/{task_id}")
-async def admin_task_status(task_id: str) -> JSONResponse | dict[str, Any]:
+async def admin_task_status(task_id: str):
     payload = load_task_payload(task_id)
     if not payload:
         return _error(f"task {task_id} not found", 404)
@@ -181,3 +161,8 @@ async def health() -> dict[str, Any]:
             "enable_affected_graph_expansion": ENABLE_AFFECTED_GRAPH_EXPANSION,
         },
     }
+
+
+__all__ = [
+    "router",
+]

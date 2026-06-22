@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 import uuid
@@ -14,53 +13,39 @@ from .app_state import in_flight
 from .client import chat_once, unload_model
 from .config import (
     AUTO_UNLOAD_AFTER_STAGE,
-    DUPLICATE_WINDOW_SECONDS,
     FILE_PLANNER_CTX,
     FILE_PLANNER_MODEL,
     TASK_PLANNER_CTX,
     TASK_PLANNER_MODEL,
 )
-from .context import normalize_apply_mode, resolve_pipeline_mode, resolve_workspace_root
 from .db import save_task_state
+from .logging_utils import log_step
 from .pipeline_agent import run_agent_pipeline_and_stream
-from .pipeline_common import load_json
+from .pipeline_common import (
+    cleanup_in_flight,
+    is_duplicate_in_flight,
+    load_json,
+    mark_in_flight,
+)
 from .pipeline_plan import run_plan_pipeline_and_stream
 from .prompts import FILE_PLANNER_SYSTEM, TASK_PLANNER_SYSTEM
 from .repository import scan_repo
-from .retrieve import (
+from .request_context import build_request_context
+from .retrieval import (
     build_repo_summary,
     build_selected_files_text,
     format_retrieved_files,
+    pick_selected_paths_from_file_plan,
     read_selected_files,
     simple_retrieve,
 )
 from .schemas import TaskState
-from .logging_utils import log_step
 
 router = APIRouter()
 
 
 def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
-
-
-def _latest_user_content(messages: list[dict[str, Any]]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            return content if isinstance(content, str) else str(content)
-    return ""
-
-
-def _build_request_hash(content: str, repo_root: str, pipeline_mode: str) -> str:
-    payload = {
-        "content": content,
-        "root": repo_root,
-        "mode": pipeline_mode,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 def _default_task_plan(user_request: str) -> dict[str, Any]:
@@ -87,30 +72,26 @@ def _default_file_plan() -> dict[str, Any]:
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-    user_messages = body.get("messages", [])
-    if not isinstance(user_messages, list) or not user_messages:
+    context = build_request_context(body)
+
+    messages = context["messages"]
+    latest_user_content = context["latest_user_content"]
+    pipeline_mode = context["pipeline_mode"]
+    requested_model = context["requested_model"]
+    apply_mode = context["apply_mode"]
+    effective_root = context["effective_root"]
+    request_hash = context["request_hash"]
+
+    if not isinstance(messages, list) or not messages:
         return _error("messages is required", 400)
 
-    pipeline_mode = resolve_pipeline_mode(body)
-    requested_model = str(body.get("model", "")).strip()
-    apply_mode = normalize_apply_mode(body)
-    effective_root = resolve_workspace_root(body)
-
-    latest_user_content = _latest_user_content(user_messages)
     if not latest_user_content.strip():
         return _error("at least one user message is required", 400)
 
-    request_hash = _build_request_hash(
-        latest_user_content,
-        effective_root.as_posix(),
-        pipeline_mode,
-    )
-
-    now = time.perf_counter()
-    started_at = in_flight.get(request_hash)
-    if started_at is not None and now - started_at < DUPLICATE_WINDOW_SECONDS:
+    cleanup_in_flight(in_flight)
+    if is_duplicate_in_flight(in_flight, request_hash):
         return _error("duplicate request in flight", 429)
-    in_flight[request_hash] = now
+    mark_in_flight(in_flight, request_hash)
 
     total_start = time.perf_counter()
     task_id = str(uuid.uuid4())
@@ -164,6 +145,7 @@ async def chat_completions(request: Request):
         )
         state.task_plan = load_json(task_plan_text, _default_task_plan(latest_user_content))
         save_task_state(state)
+
         if AUTO_UNLOAD_AFTER_STAGE:
             unload_model(TASK_PLANNER_MODEL)
 
@@ -190,15 +172,12 @@ async def chat_completions(request: Request):
         )
         state.file_plan = load_json(file_plan_text, _default_file_plan())
         save_task_state(state)
+
         if AUTO_UNLOAD_AFTER_STAGE:
             unload_model(FILE_PLANNER_MODEL)
 
-        read_paths = list(state.file_plan.get("must_read", []) or [])
-        edit_paths = list(state.file_plan.get("must_edit", []) or []) + list(
-            state.file_plan.get("may_edit", []) or []
-        )
-        all_paths = list(dict.fromkeys(read_paths + edit_paths))
-        selected_files = read_selected_files(effective_root, all_paths)
+        selected_paths = pick_selected_paths_from_file_plan(state.file_plan)
+        selected_files = read_selected_files(effective_root, selected_paths)
         selected_files_text = build_selected_files_text(selected_files)
 
         if pipeline_mode == "plan":
@@ -208,6 +187,7 @@ async def chat_completions(request: Request):
                 selected_files_text=selected_files_text,
                 repo_summary=repo_summary,
                 request_hash=request_hash,
+                in_flight=in_flight,
                 total_start=total_start,
             )
 
@@ -216,8 +196,15 @@ async def chat_completions(request: Request):
             latest_user_content=latest_user_content,
             selected_files_text=selected_files_text,
             request_hash=request_hash,
+            in_flight=in_flight,
             total_start=total_start,
         )
+
     except Exception:
         in_flight.pop(request_hash, None)
         raise
+
+
+__all__ = [
+    "router",
+]
