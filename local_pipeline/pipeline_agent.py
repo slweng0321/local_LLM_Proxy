@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi.responses import StreamingResponse
-
-from .client import chat_once, client, load_json, unload_model
+from .client import chat_once, chat_stream, load_json, unload_model
 from .config import (
     AUTO_UNLOAD_AFTER_STAGE,
     CODER_CTX,
@@ -15,7 +14,6 @@ from .config import (
     CODER_PREDICT,
     CRITIC_CTX,
     CRITIC_MODEL,
-    REQUEST_TIMEOUT,
     REVIEWER_CTX,
     REVIEWER_MODEL,
     REVIEWER_PREDICT,
@@ -57,7 +55,7 @@ def _build_status_after_apply(state: TaskState) -> str:
     return "dry_run_complete"
 
 
-def run_agent_pipeline_and_stream(
+async def run_agent_pipeline_and_stream(
     *,
     state: TaskState,
     latest_user_content: str,
@@ -65,12 +63,12 @@ def run_agent_pipeline_and_stream(
     request_hash: str,
     in_flight: dict[str, float],
     total_start: float,
-) -> StreamingResponse:
+) -> AsyncIterator[str]:
     allowed_paths = safe_paths(state.file_plan)
 
     t = log_step(f"💻 [Coder · {CODER_MODEL}] 生成多檔案修改...")
     coder_start = time.perf_counter()
-    coder_text = chat_once(
+    coder_text = await chat_once(
         model=CODER_MODEL,
         system=CODER_SYSTEM,
         messages=[
@@ -91,14 +89,14 @@ def run_agent_pipeline_and_stream(
     state.generated_files = filter_generated_files(coder_json.get("files", []), allowed_paths)
     state.status = "coded"
     state.metrics["coder_elapsed_sec"] = round(time.perf_counter() - coder_start, 2)
-    save_task_state(state)
+    await asyncio.to_thread(save_task_state, state)
 
     if AUTO_UNLOAD_AFTER_STAGE:
-        unload_model(CODER_MODEL)
+        await unload_model(CODER_MODEL)
 
     t = log_step(f"🧪 [Critic · {CRITIC_MODEL}] 檢查 multi-file patches...", time.perf_counter() - t)
     critic_start = time.perf_counter()
-    critic_text = chat_once(
+    critic_text = await chat_once(
         model=CRITIC_MODEL,
         system=CRITIC_SYSTEM,
         messages=[
@@ -119,103 +117,72 @@ def run_agent_pipeline_and_stream(
     state.critic_report = load_json(critic_text, CRITIC_RESULT_DEFAULT.copy())
     state.status = "critic_done"
     state.metrics["critic_elapsed_sec"] = round(time.perf_counter() - critic_start, 2)
-    save_task_state(state)
+    await asyncio.to_thread(save_task_state, state)
 
     if AUTO_UNLOAD_AFTER_STAGE:
-        unload_model(CRITIC_MODEL)
+        await unload_model(CRITIC_MODEL)
 
-    t = log_step(f"🔍 [Reviewer · {REVIEWER_MODEL}] 整理最終 multi-file 結果並串流...", time.perf_counter() - t)
-    stream_response = client.chat.completions.create(
-        model=REVIEWER_MODEL,
-        messages=[
-            {"role": "system", "content": REVIEWER_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"## User Request\n{latest_user_content}\n\n"
-                    f"## Task Plan\n{json.dumps(state.task_plan, ensure_ascii=False)}\n\n"
-                    f"## File Plan\n{json.dumps(state.file_plan, ensure_ascii=False)}\n\n"
-                    f"## Original Selected Files\n{selected_files_text}\n\n"
-                    f"## Generated Files\n{json.dumps(state.generated_files, ensure_ascii=False)}\n\n"
-                    f"## Critic Report\n{json.dumps(state.critic_report, ensure_ascii=False)}"
-                ),
-            },
-        ],
-        temperature=0.15,
-        stream=True,
-        extra_body={
-            "options": {
-                "num_ctx": REVIEWER_CTX,
-                "num_predict": REVIEWER_PREDICT,
-            }
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    reviewer_start = time.perf_counter()
+    stage_start = time.perf_counter()
     first_chunk = True
     final_buffer: list[str] = []
 
-    def stream_generator():
-        nonlocal first_chunk
+    try:
+        stream = await chat_stream(
+            model=REVIEWER_MODEL,
+            system=REVIEWER_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"## User Request\n{latest_user_content}\n\n"
+                        f"## Task Plan\n{json.dumps(state.task_plan, ensure_ascii=False)}\n\n"
+                        f"## File Plan\n{json.dumps(state.file_plan, ensure_ascii=False)}\n\n"
+                        f"## Original Selected Files\n{selected_files_text}\n\n"
+                        f"## Generated Files\n{json.dumps(state.generated_files, ensure_ascii=False)}\n\n"
+                        f"## Critic Report\n{json.dumps(state.critic_report, ensure_ascii=False)}"
+                    ),
+                }
+            ],
+            temperature=0.15,
+            options={"num_ctx": REVIEWER_CTX, "num_predict": REVIEWER_PREDICT},
+        )
 
-        try:
-            for chunk in stream_response:
-                text = chunk.choices[0].delta.content or ""
-                if text:
-                    final_buffer.append(text)
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content or ""
+            if text:
+                final_buffer.append(text)
 
-                if first_chunk:
-                    print(f" ⚡ TTFT: {time.perf_counter() - reviewer_start:.2f}s")
-                    first_chunk = False
+            if first_chunk:
+                print(f" ⚡ TTFT: {time.perf_counter() - stage_start:.2f}s")
+                first_chunk = False
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n"
 
-        finally:
-            try:
-                full_text = "".join(final_buffer)
-                reviewer_json = load_json(full_text, REVIEWER_RESULT_DEFAULT.copy())
+    except asyncio.CancelledError:
+        raise
+    finally:
+        full_text = "".join(final_buffer)
+        reviewer_json = load_json(full_text, REVIEWER_RESULT_DEFAULT.copy())
 
-                state.final_files = filter_generated_files(
-                    reviewer_json.get("files", []),
-                    allowed_paths,
-                )
-                state.status = "reviewed"
+        state.final_files = filter_generated_files(
+            reviewer_json.get("files", []),
+            allowed_paths,
+        )
+        state.status = "reviewed"
 
-                state.apply_result = apply_patches(
-                    Path(state.repo_root),
-                    state.task_id,
-                    state.final_files,
-                    apply_mode=state.apply_mode,
-                )
-                state.status = _build_status_after_apply(state)
-                state.metrics["reviewer_stream_elapsed_sec"] = round(
-                    time.perf_counter() - reviewer_start,
-                    2,
-                )
-                state.metrics["total_elapsed_sec"] = round(time.perf_counter() - total_start, 2)
-                save_task_state(state)
-            finally:
-                if AUTO_UNLOAD_AFTER_STAGE:
-                    unload_model(REVIEWER_MODEL)
+        state.apply_result = await asyncio.to_thread(
+            apply_patches,
+            Path(state.repo_root),
+            state.task_id,
+            state.final_files,
+            apply_mode=state.apply_mode,
+        )
+        state.status = _build_status_after_apply(state)
+        state.metrics["reviewer_stream_elapsed_sec"] = round(time.perf_counter() - stage_start, 2)
+        state.metrics["total_elapsed_sec"] = round(time.perf_counter() - total_start, 2)
+        await asyncio.to_thread(save_task_state, state)
 
-                _clear_in_flight(in_flight, request_hash)
-                yield "data: [DONE]\n\n"
+        if AUTO_UNLOAD_AFTER_STAGE:
+            await unload_model(REVIEWER_MODEL)
 
-    return StreamingResponse(
-        stream_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-__all__ = [
-    "CODER_RESULT_DEFAULT",
-    "CRITIC_RESULT_DEFAULT",
-    "REVIEWER_RESULT_DEFAULT",
-    "run_agent_pipeline_and_stream",
-]
+        _clear_in_flight(in_flight, request_hash)

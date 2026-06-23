@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,20 +16,6 @@ from .config import (
 
 """
 Request-context helpers.
-
-Responsibilities:
-- resolve pipeline mode from request model alias
-- normalize apply mode
-- resolve effective workspace root
-- extract latest user message text
-- build stable request hashes for duplicate suppression
-
-Non-responsibilities:
-- repository scanning
-- DB access
-- model calls
-- patching
-- pipeline orchestration
 """
 
 
@@ -62,6 +49,12 @@ def find_git_root(start: Path) -> Path | None:
         if current.parent == current:
             return None
         current = current.parent
+
+
+@lru_cache(maxsize=16)
+def _cached_git_root(path_str: str) -> str | None:
+    root = find_git_root(Path(path_str))
+    return root.as_posix() if root is not None else None
 
 
 def _coerce_existing_path(value: Any) -> Path | None:
@@ -108,9 +101,9 @@ def resolve_workspace_root(body: dict[str, Any]) -> Path:
     if hinted_path is not None:
         return hinted_path
 
-    git_root = find_git_root(WORKSPACE_ROOT)
-    if git_root is not None:
-        return git_root
+    cached_git = _cached_git_root(WORKSPACE_ROOT.as_posix())
+    if cached_git is not None:
+        return Path(cached_git)
 
     return WORKSPACE_ROOT
 
@@ -149,11 +142,15 @@ def build_request_hash(
     latest_user_content: str,
     effective_root: Path,
     pipeline_mode: str,
+    apply_mode: str,
+    requested_model: str,
 ) -> str:
     payload = {
         "content": latest_user_content,
         "root": effective_root.as_posix(),
         "mode": pipeline_mode,
+        "apply_mode": apply_mode,
+        "model": requested_model,
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -166,10 +163,14 @@ def build_request_context(body: dict[str, Any]) -> dict[str, Any]:
     apply_mode = normalize_apply_mode(body)
     effective_root = resolve_workspace_root(body)
     latest_user_content = extract_latest_user_content(messages)
+    requested_model = str(body.get("model", "")).strip()
+
     request_hash = build_request_hash(
         latest_user_content=latest_user_content,
         effective_root=effective_root,
         pipeline_mode=pipeline_mode,
+        apply_mode=apply_mode,
+        requested_model=requested_model,
     )
 
     return {
@@ -179,7 +180,7 @@ def build_request_context(body: dict[str, Any]) -> dict[str, Any]:
         "effective_root": effective_root,
         "latest_user_content": latest_user_content,
         "request_hash": request_hash,
-        "requested_model": str(body.get("model", "")).strip(),
+        "requested_model": requested_model,
     }
 
 

@@ -58,11 +58,9 @@ OPENAI_BASE = f"{OLLAMA_BASE}/v1"
 
 WORKSPACE_ROOT = Path(_get_env_str("WORKSPACE_ROOT", ".")).resolve()
 STATE_DIR = Path(_get_env_str("STATE_DIR", ".repo_aware_state")).resolve()
-STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_DB = STATE_DIR / "tasks.sqlite3"
 PATCH_BACKUP_DIR = STATE_DIR / "backups"
-PATCH_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_APPLY_MODE = _normalize_apply_mode(_get_env_str("DEFAULT_APPLY_MODE", "dry-run"))
 
@@ -77,7 +75,7 @@ AUTO_UNLOAD_AFTER_STAGE = _get_env_bool("AUTO_UNLOAD_AFTER_STAGE", True)
 REQUEST_TIMEOUT = _get_env_int("REQUEST_TIMEOUT", 600)
 DUPLICATE_WINDOW_SECONDS = _get_env_int("DUPLICATE_WINDOW_SECONDS", 8)
 
-CHAT_MODEL = _get_env_str("CHAT_MODEL", "qwen3.5:4b")
+CHAT_MODEL = _get_env_str("CHAT_MODEL", "qwen3.5:9b")
 TASK_PLANNER_MODEL = _get_env_str("TASK_PLANNER_MODEL", "qwen2.5:3b-instruct")
 FILE_PLANNER_MODEL = _get_env_str("FILE_PLANNER_MODEL", "qwen2.5:3b-instruct")
 CODER_MODEL = _get_env_str("CODER_MODEL", "qwen2.5-coder:7b")
@@ -184,6 +182,15 @@ SPECIAL_SOURCE_FILENAMES = {
     "makefile",
 }
 
+
+def ensure_runtime_dirs() -> None:
+    """
+    顯式初始化 runtime directories，避免 import 階段進行同步 I/O。
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PATCH_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
 __all__ = [
     "OLLAMA_BASE",
     "OPENAI_BASE",
@@ -226,4 +233,5 @@ __all__ = [
     "EXCLUDE_SUFFIXES",
     "SOURCE_SUFFIXES",
     "SPECIAL_SOURCE_FILENAMES",
+    "ensure_runtime_dirs",
 ]

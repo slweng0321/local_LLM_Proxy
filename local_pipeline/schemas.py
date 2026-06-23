@@ -5,15 +5,6 @@ from typing import Any, Mapping
 
 """
 Shared data structures for the local pipeline.
-
-This module must stay lightweight and dependency-free:
-- no FastAPI
-- no OpenAI client
-- no filesystem side effects
-- no database logic
-- no repository scanning logic
-
-It defines stable, serializable contracts shared across modules.
 """
 
 

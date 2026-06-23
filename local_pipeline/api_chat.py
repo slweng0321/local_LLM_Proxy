@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -10,26 +11,21 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .app_state import in_flight
-from .client import chat_once, unload_model, client
+from .client import chat_once, unload_model
 from .config import (
     AUTO_UNLOAD_AFTER_STAGE,
+    CHAT_MODEL,
     FILE_PLANNER_CTX,
     FILE_PLANNER_MODEL,
     TASK_PLANNER_CTX,
     TASK_PLANNER_MODEL,
-    CHAT_MODEL,
 )
 from .db import save_task_state
 from .logging_utils import log_step
 from .pipeline_agent import run_agent_pipeline_and_stream
-from .pipeline_common import (
-    cleanup_in_flight,
-    is_duplicate_in_flight,
-    load_json,
-    mark_in_flight,
-)
+from .pipeline_common import cleanup_in_flight, is_duplicate_in_flight, load_json, mark_in_flight
 from .pipeline_plan import run_plan_pipeline_and_stream
-from .prompts import FILE_PLANNER_SYSTEM, TASK_PLANNER_SYSTEM, DIRECT_CHAT_SYSTEM
+from .prompts import DIRECT_CHAT_SYSTEM, FILE_PLANNER_SYSTEM, TASK_PLANNER_SYSTEM
 from .repository import scan_repo
 from .request_context import build_request_context
 from .retrieval import (
@@ -41,6 +37,7 @@ from .retrieval import (
     simple_retrieve,
 )
 from .schemas import TaskState
+from .streaming import sse_response
 
 router = APIRouter()
 
@@ -69,44 +66,6 @@ def _default_file_plan() -> dict[str, Any]:
         "edit_strategy": [],
     }
 
-def _direct_chat_response(
-    *,
-    latest_user_content: str,
-    request_hash: str,
-    in_flight: dict,
-    total_start: float,
-) -> StreamingResponse:
-    from fastapi.responses import StreamingResponse
-    from .config import REQUEST_TIMEOUT
-
-    stream_response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": DIRECT_CHAT_SYSTEM},
-            {"role": "user", "content": latest_user_content},
-        ],
-        temperature=0.7,
-        stream=True,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    def stream_generator():
-        try:
-            for chunk in stream_response:
-                yield f"data: {chunk.model_dump_json()}\n\n"
-        finally:
-            in_flight.pop(request_hash, None)
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        stream_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -145,30 +104,23 @@ async def chat_completions(request: Request):
         requested_model=requested_model,
         apply_mode=apply_mode,
     )
-    save_task_state(state)
+    await asyncio.to_thread(save_task_state, state)
 
-    t = log_step(
-        f"🗂️ [Workspace] root={effective_root} | mode={pipeline_mode} | apply={apply_mode}"
-    )
+    t = log_step(f"🗂️ [Workspace] root={effective_root} | mode={pipeline_mode} | apply={apply_mode}")
 
     try:
         t = log_step(f"📂 [RepoScan] 掃描 {effective_root}...", time.perf_counter() - t)
-        state.repo_manifest = scan_repo(effective_root)
+        state.repo_manifest = await asyncio.to_thread(scan_repo, effective_root)
 
         t = log_step("🔍 [Retrieve] 抓取相關檔案...", time.perf_counter() - t)
-        retrieved = simple_retrieve(effective_root, latest_user_content, state.repo_manifest)
+        retrieved = await asyncio.to_thread(simple_retrieve, effective_root, latest_user_content, state.repo_manifest)
         state.retrieved_files = [asdict(item) for item in retrieved]
         retrieved_text = format_retrieved_files(retrieved)
 
         repo_summary = build_repo_summary(state)
 
-        t = log_step(
-            f"🧭 [TaskPlanner · {TASK_PLANNER_MODEL}] 分析任務目標...",
-            time.perf_counter() - t,
-        )
-        
-        # ── 原有的 TaskPlanner 呼叫 ──
-        task_plan_text = chat_once(
+        t = log_step(f"🧭 [TaskPlanner · {TASK_PLANNER_MODEL}] 分析任務目標...", time.perf_counter() - t)
+        task_plan_text = await chat_once(
             model=TASK_PLANNER_MODEL,
             system=TASK_PLANNER_SYSTEM,
             messages=[
@@ -185,27 +137,26 @@ async def chat_completions(request: Request):
             options={"num_ctx": TASK_PLANNER_CTX},
         )
         state.task_plan = load_json(task_plan_text, _default_task_plan(latest_user_content))
-        save_task_state(state)
+        await asyncio.to_thread(save_task_state, state)
 
         if AUTO_UNLOAD_AFTER_STAGE:
-            unload_model(TASK_PLANNER_MODEL)
+            await unload_model(TASK_PLANNER_MODEL)
 
-        # ── 新增：偵測普通對話，直接回應 ──
         if state.task_plan.get("task_goal") == "__CHAT__":
-            t = log_step("💬 [DirectChat] 普通對話，直接回應...", time.perf_counter() - t)
-            return _direct_chat_response(
-                latest_user_content=latest_user_content,
-                request_hash=request_hash,
-                in_flight=in_flight,
-                total_start=total_start,
-            )
+            async def direct_chat_iter():
+                stream = await chat_once(
+                    model=CHAT_MODEL,
+                    system=DIRECT_CHAT_SYSTEM,
+                    messages=[{"role": "user", "content": latest_user_content}],
+                    temperature=0.7,
+                    options={"num_ctx": TASK_PLANNER_CTX},
+                )
+                yield stream
 
-        # ── 以下原有的 FilePlanner 邏輯維持不變 ──
-        t = log_step(
-            f"📋 [FilePlanner · {FILE_PLANNER_MODEL}] 規劃檔案操作...",
-            time.perf_counter() - t,
-        )
-        file_plan_text = chat_once(
+            return await sse_response(direct_chat_iter(), on_close=lambda: in_flight.delete(request_hash))
+
+        t = log_step(f"📋 [FilePlanner · {FILE_PLANNER_MODEL}] 規劃檔案操作...", time.perf_counter() - t)
+        file_plan_text = await chat_once(
             model=FILE_PLANNER_MODEL,
             system=FILE_PLANNER_SYSTEM,
             messages=[
@@ -223,40 +174,35 @@ async def chat_completions(request: Request):
             options={"num_ctx": FILE_PLANNER_CTX},
         )
         state.file_plan = load_json(file_plan_text, _default_file_plan())
-        save_task_state(state)
+        await asyncio.to_thread(save_task_state, state)
 
         if AUTO_UNLOAD_AFTER_STAGE:
-            unload_model(FILE_PLANNER_MODEL)
+            await unload_model(FILE_PLANNER_MODEL)
 
         selected_paths = pick_selected_paths_from_file_plan(state.file_plan)
-        selected_files = read_selected_files(effective_root, selected_paths)
+        selected_files = await asyncio.to_thread(read_selected_files, effective_root, selected_paths)
         selected_files_text = build_selected_files_text(selected_files)
 
         if pipeline_mode == "plan":
-            return run_plan_pipeline_and_stream(
-                state=state,
-                latest_user_content=latest_user_content,
-                selected_files_text=selected_files_text,
-                repo_summary=repo_summary,
-                request_hash=request_hash,
-                in_flight=in_flight,
-                total_start=total_start,
+            return await sse_response(
+                run_plan_pipeline_and_stream(
+                    state=state,
+                    latest_user_content=latest_user_content,
+                    selected_files_text=selected_files_text,
+                    repo_summary=repo_summary,
+                    request_hash=request_hash,
+                    in_flight=in_flight,
+                    total_start=total_start,
+                ),
+                on_close=lambda: in_flight.delete(request_hash),
             )
 
-        return run_agent_pipeline_and_stream(
-            state=state,
-            latest_user_content=latest_user_content,
-            selected_files_text=selected_files_text,
-            request_hash=request_hash,
-            in_flight=in_flight,
-            total_start=total_start,
-        )
-
+    except asyncio.CancelledError:
+        await in_flight.delete(request_hash)
+        raise
     except Exception:
-        in_flight.pop(request_hash, None)
+        await in_flight.delete(request_hash)
         raise
 
 
-__all__ = [
-    "router",
-]
+__all__ = ["router"]

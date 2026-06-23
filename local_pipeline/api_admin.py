@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +74,7 @@ async def admin_unload(request: Request):
     if not model:
         return _error("model is required", 400)
 
-    unload_model(str(model))
+    await asyncio.to_thread(unload_model, str(model))
     return {"ok": True, "model": str(model)}
 
 
@@ -84,14 +85,15 @@ async def admin_apply(request: Request):
     if not task_id:
         return _error("task_id is required", 400)
 
-    payload = load_task_payload(str(task_id))
+    payload = await asyncio.to_thread(load_task_payload, str(task_id))
     if not payload:
         return _error(f"task {task_id} not found", 404)
 
     final_files = payload.get("final_files", [])
     repo_root = Path(payload.get("repo_root", ".")).resolve()
 
-    result = apply_patches(
+    result = await asyncio.to_thread(
+        apply_patches,
         repo_root,
         str(task_id),
         final_files,
@@ -100,7 +102,7 @@ async def admin_apply(request: Request):
     payload["apply_mode"] = "apply"
     payload["apply_result"] = result
     payload["status"] = "applied"
-    update_task_payload(str(task_id), payload)
+    await asyncio.to_thread(update_task_payload, str(task_id), payload)
     return result
 
 
@@ -111,20 +113,20 @@ async def admin_rollback(request: Request):
     if not task_id:
         return _error("task_id is required", 400)
 
-    payload = load_task_payload(str(task_id))
+    payload = await asyncio.to_thread(load_task_payload, str(task_id))
     repo_root = Path(payload.get("repo_root", ".")).resolve() if payload else WORKSPACE_ROOT
 
-    result = rollback_task(str(task_id), repo_root)
+    result = await asyncio.to_thread(rollback_task, str(task_id), repo_root)
     if payload:
         payload["status"] = "rolled_back"
-        update_task_payload(str(task_id), payload)
+        await asyncio.to_thread(update_task_payload, str(task_id), payload)
 
     return result
 
 
 @router.get("/admin/task/{task_id}")
 async def admin_task_status(task_id: str):
-    payload = load_task_payload(task_id)
+    payload = await asyncio.to_thread(load_task_payload, task_id)
     if not payload:
         return _error(f"task {task_id} not found", 404)
     return payload
@@ -163,6 +165,4 @@ async def health() -> dict[str, Any]:
     }
 
 
-__all__ = [
-    "router",
-]
+__all__ = ["router"]
