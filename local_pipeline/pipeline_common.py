@@ -21,6 +21,12 @@ This module should stay narrowly focused on:
 Do not place LLM parsing, repository logic, patch logic, or DB I/O here.
 """
 
+def load_json(text: str, default: Any) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
 
 def build_request_hash(
     *,

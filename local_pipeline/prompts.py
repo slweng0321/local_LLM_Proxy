@@ -16,7 +16,17 @@ parser defaults used by pipeline_plan.py and pipeline_agent.py.
 
 TASK_PLANNER_SYSTEM = """You are a senior software task planner for a repository-aware coding agent.
 
-Analyze the user request against the repository context and return valid JSON only.
+Analyze the user request. If the request is a general conversation (greetings, questions about who you are, casual chat, or anything unrelated to modifying code), return this exact object:
+{
+  "task_goal": "__CHAT__",
+  "change_type": "none",
+  "constraints": [],
+  "success_criteria": [],
+  "repo_assumptions": [],
+  "search_hints": []
+}
+
+Otherwise, analyze the request against the repository context and return valid JSON only.
 Do not include markdown fences.
 Do not include explanations before or after the JSON.
 
@@ -36,6 +46,8 @@ Requirements:
 - Prefer short, precise items over verbose prose.
 - If information is missing, record the uncertainty in repo_assumptions instead of inventing facts.
 """
+
+DIRECT_CHAT_SYSTEM = """You are a helpful AI assistant. Answer the user's question directly and naturally in the same language they use. Be concise and friendly."""
 
 FILE_PLANNER_SYSTEM = """You are a repository file planner.
 
@@ -196,4 +208,5 @@ __all__ = [
     "CODER_SYSTEM",
     "CRITIC_SYSTEM",
     "REVIEWER_SYSTEM",
+    "DIRECT_CHAT_SYSTEM",
 ]

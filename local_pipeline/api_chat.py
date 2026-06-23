@@ -10,13 +10,14 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .app_state import in_flight
-from .client import chat_once, unload_model
+from .client import chat_once, unload_model, client
 from .config import (
     AUTO_UNLOAD_AFTER_STAGE,
     FILE_PLANNER_CTX,
     FILE_PLANNER_MODEL,
     TASK_PLANNER_CTX,
     TASK_PLANNER_MODEL,
+    CHAT_MODEL,
 )
 from .db import save_task_state
 from .logging_utils import log_step
@@ -28,7 +29,7 @@ from .pipeline_common import (
     mark_in_flight,
 )
 from .pipeline_plan import run_plan_pipeline_and_stream
-from .prompts import FILE_PLANNER_SYSTEM, TASK_PLANNER_SYSTEM
+from .prompts import FILE_PLANNER_SYSTEM, TASK_PLANNER_SYSTEM, DIRECT_CHAT_SYSTEM
 from .repository import scan_repo
 from .request_context import build_request_context
 from .retrieval import (
@@ -68,6 +69,44 @@ def _default_file_plan() -> dict[str, Any]:
         "edit_strategy": [],
     }
 
+def _direct_chat_response(
+    *,
+    latest_user_content: str,
+    request_hash: str,
+    in_flight: dict,
+    total_start: float,
+) -> StreamingResponse:
+    from fastapi.responses import StreamingResponse
+    from .config import REQUEST_TIMEOUT
+
+    stream_response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": DIRECT_CHAT_SYSTEM},
+            {"role": "user", "content": latest_user_content},
+        ],
+        temperature=0.7,
+        stream=True,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    def stream_generator():
+        try:
+            for chunk in stream_response:
+                yield f"data: {chunk.model_dump_json()}\n\n"
+        finally:
+            in_flight.pop(request_hash, None)
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -127,6 +166,8 @@ async def chat_completions(request: Request):
             f"🧭 [TaskPlanner · {TASK_PLANNER_MODEL}] 分析任務目標...",
             time.perf_counter() - t,
         )
+        
+        # ── 原有的 TaskPlanner 呼叫 ──
         task_plan_text = chat_once(
             model=TASK_PLANNER_MODEL,
             system=TASK_PLANNER_SYSTEM,
@@ -149,6 +190,17 @@ async def chat_completions(request: Request):
         if AUTO_UNLOAD_AFTER_STAGE:
             unload_model(TASK_PLANNER_MODEL)
 
+        # ── 新增：偵測普通對話，直接回應 ──
+        if state.task_plan.get("task_goal") == "__CHAT__":
+            t = log_step("💬 [DirectChat] 普通對話，直接回應...", time.perf_counter() - t)
+            return _direct_chat_response(
+                latest_user_content=latest_user_content,
+                request_hash=request_hash,
+                in_flight=in_flight,
+                total_start=total_start,
+            )
+
+        # ── 以下原有的 FilePlanner 邏輯維持不變 ──
         t = log_step(
             f"📋 [FilePlanner · {FILE_PLANNER_MODEL}] 規劃檔案操作...",
             time.perf_counter() - t,

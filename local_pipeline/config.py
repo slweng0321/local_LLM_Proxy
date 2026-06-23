@@ -77,6 +77,7 @@ AUTO_UNLOAD_AFTER_STAGE = _get_env_bool("AUTO_UNLOAD_AFTER_STAGE", True)
 REQUEST_TIMEOUT = _get_env_int("REQUEST_TIMEOUT", 600)
 DUPLICATE_WINDOW_SECONDS = _get_env_int("DUPLICATE_WINDOW_SECONDS", 8)
 
+CHAT_MODEL = _get_env_str("CHAT_MODEL", "qwen3.5:4b")
 TASK_PLANNER_MODEL = _get_env_str("TASK_PLANNER_MODEL", "qwen2.5:3b-instruct")
 FILE_PLANNER_MODEL = _get_env_str("FILE_PLANNER_MODEL", "qwen2.5:3b-instruct")
 CODER_MODEL = _get_env_str("CODER_MODEL", "qwen2.5-coder:7b")
@@ -200,6 +201,7 @@ __all__ = [
     "AUTO_UNLOAD_AFTER_STAGE",
     "REQUEST_TIMEOUT",
     "DUPLICATE_WINDOW_SECONDS",
+    "CHAT_MODEL",
     "TASK_PLANNER_MODEL",
     "FILE_PLANNER_MODEL",
     "CODER_MODEL",
