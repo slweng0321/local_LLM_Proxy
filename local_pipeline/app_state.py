@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI
@@ -17,30 +16,31 @@ Responsibilities:
 @dataclass(slots=True)
 class InFlightRegistry:
     """
-    Async-safe in-flight registry for duplicate suppression.
+    Synchronous in-flight registry for duplicate suppression.
+
+    This object deliberately exposes a dict-like API so lifecycle helpers can
+    operate on a single, consistent interface without mixing async/sync access
+    patterns.
     """
     data: dict[str, float] = field(default_factory=dict)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def get(self, key: str) -> float | None:
-        async with self.lock:
-            return self.data.get(key)
+    def get(self, key: str) -> float | None:
+        return self.data.get(key)
 
-    async def set(self, key: str, value: float) -> None:
-        async with self.lock:
-            self.data[key] = value
+    def set(self, key: str, value: float) -> None:
+        self.data[key] = value
 
-    async def delete(self, key: str) -> None:
-        async with self.lock:
-            self.data.pop(key, None)
+    def delete(self, key: str) -> None:
+        self.data.pop(key, None)
 
-    async def pop(self, key: str, default: float | None = None) -> float | None:
-        async with self.lock:
-            return self.data.pop(key, default)
+    def pop(self, key: str, default: float | None = None) -> float | None:
+        return self.data.pop(key, default)
 
-    async def snapshot(self) -> dict[str, float]:
-        async with self.lock:
-            return dict(self.data)
+    def items(self):
+        return self.data.items()
+
+    def snapshot(self) -> dict[str, float]:
+        return dict(self.data)
 
 
 app = FastAPI()

@@ -13,9 +13,10 @@ from .config import (
     PLAN_REVIEWER_PREDICT,
 )
 from .db import save_task_state
-from .logging_utils import log_step
+from .logging_utils import log_heartbeat, log_stage_done, log_stage_start, log_stage_unload, log_step, log_ttft
 from .prompts import PLAN_REVIEWER_SYSTEM
 from .schemas import TaskState
+from .streaming import format_chunk, openai_chat_completion_chunk, openai_chat_completion_final
 
 PLAN_RESULT_DEFAULT: dict[str, Any] = {
     "summary": [],
@@ -28,7 +29,18 @@ PLAN_RESULT_DEFAULT: dict[str, Any] = {
 }
 
 
-def _clear_in_flight(in_flight: dict[str, float], request_hash: str) -> None:
+def _sse_error(message: str, code: str) -> AsyncIterator[str]:
+    async def iterator():
+        yield format_chunk(f"\n> ❌ **Pipeline 錯誤**: {message}\n\n")
+        yield "[DONE]"
+
+    return iterator()
+
+
+def _clear_in_flight(in_flight: Any, request_hash: str) -> None:
+    if hasattr(in_flight, "delete"):
+        in_flight.delete(request_hash)
+        return
     in_flight.pop(request_hash, None)
 
 
@@ -42,11 +54,13 @@ async def run_plan_pipeline_and_stream(
     in_flight: dict[str, float],
     total_start: float,
 ) -> AsyncIterator[str]:
-    log_step(f"📝 [PlanReviewer · {PLAN_REVIEWER_MODEL}] 產生唯讀計畫並串流...")
-
-    stage_start = time.perf_counter()
+    stage_start = log_stage_start("📝 [PlanReviewer]", PLAN_REVIEWER_MODEL, "開始產生唯讀計畫並串流...")
     first_chunk = True
     final_buffer: list[str] = []
+    completed_normally = False
+
+    yield f"data: {log_heartbeat('正在進行 TaskPlanner / FilePlanner 分析...')}"
+    yield f"data: {log_heartbeat('TaskPlanner 完成，準備進入 FilePlanner / PlanReviewer...')}"
 
     try:
         stream = await chat_stream(
@@ -68,19 +82,44 @@ async def run_plan_pipeline_and_stream(
             options={"num_ctx": PLAN_REVIEWER_CTX, "num_predict": PLAN_REVIEWER_PREDICT},
         )
 
+        if stream is None:
+            async for chunk in _sse_error(
+                f"PlanReviewer model {PLAN_REVIEWER_MODEL} returned no stream.",
+                "empty_plan_reviewer_stream",
+            ):
+                yield chunk
+            return
+
         async for chunk in stream:
-            text = chunk.choices[0].delta.content or ""
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                async for err_chunk in _sse_error(
+                    f"PlanReviewer model {PLAN_REVIEWER_MODEL} returned a chunk without choices.",
+                    "plan_reviewer_no_choices",
+                ):
+                    yield err_chunk
+                return
+
+            delta = getattr(choices[0], "delta", None)
+            text = getattr(delta, "content", None) or ""
             if text:
                 final_buffer.append(text)
 
             if first_chunk:
-                print(f" ⚡ TTFT: {time.perf_counter() - stage_start:.2f}s")
+                log_ttft(stage_start)
                 first_chunk = False
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            if text:
+                yield format_chunk(text, chunk_id=f"chatcmpl-{state.task_id}", model=PLAN_REVIEWER_MODEL)
+
+        completed_normally = True
 
     except asyncio.CancelledError:
         raise
+    except Exception as exc:
+        async for chunk in _sse_error(f"Plan pipeline failed: {exc}", "plan_pipeline_exception"):
+            yield chunk
+        return
     finally:
         full_text = "".join(final_buffer)
         state.plan_result = load_json(full_text, PLAN_RESULT_DEFAULT.copy())
@@ -91,5 +130,19 @@ async def run_plan_pipeline_and_stream(
 
         if AUTO_UNLOAD_AFTER_STAGE:
             await unload_model(PLAN_REVIEWER_MODEL)
+            log_stage_unload(PLAN_REVIEWER_MODEL)
 
-        _clear_in_flight(in_flight, request_hash)
+        log_stage_done("PlanReviewer", PLAN_REVIEWER_MODEL, stage_start)
+
+        try:
+            pass
+        finally:
+            _clear_in_flight(in_flight, request_hash)
+
+
+def build_plan_completion_payload(state: TaskState, content: str) -> str:
+    return openai_chat_completion_final(
+        chunk_id=f"chatcmpl-{state.task_id}",
+        model=PLAN_REVIEWER_MODEL,
+        content=content,
+    )

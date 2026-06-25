@@ -1253,7 +1253,6 @@ def _run_plan_pipeline_and_stream(
             _save_task_state(state)
             if AUTO_UNLOAD_AFTER_STAGE:
                 _unload_model(PLAN_REVIEWER_MODEL)
-            yield "data: [DONE]\n\n"
             IN_FLIGHT.pop(request_hash, None)
 
     return StreamingResponse(
@@ -1344,7 +1343,6 @@ def _run_agent_pipeline_and_stream(
             _save_task_state(state)
             if AUTO_UNLOAD_AFTER_STAGE:
                 _unload_model(REVIEWER_MODEL)
-            yield "data: [DONE]\n\n"
             IN_FLIGHT.pop(request_hash, None)
 
     return StreamingResponse(

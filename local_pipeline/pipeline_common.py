@@ -45,34 +45,40 @@ def build_request_hash(
 
 
 def is_duplicate_in_flight(
-    in_flight: dict[str, float],
+    in_flight: Any,
     request_hash: str,
     *,
     now: float | None = None,
     window_seconds: int = DUPLICATE_WINDOW_SECONDS,
 ) -> bool:
     current = time.perf_counter() if now is None else now
-    last_seen = in_flight.get(request_hash)
+    last_seen = in_flight.get(request_hash) if hasattr(in_flight, "get") else None
     return last_seen is not None and (current - last_seen) < window_seconds
 
 
 def mark_in_flight(
-    in_flight: dict[str, float],
+    in_flight: Any,
     request_hash: str,
     *,
     now: float | None = None,
 ) -> float:
     marked_at = time.perf_counter() if now is None else now
-    in_flight[request_hash] = marked_at
+    if hasattr(in_flight, "set"):
+        in_flight.set(request_hash, marked_at)
+    else:
+        in_flight[request_hash] = marked_at
     return marked_at
 
 
-def clear_in_flight(in_flight: dict[str, float], request_hash: str) -> None:
+def clear_in_flight(in_flight: Any, request_hash: str) -> None:
+    if hasattr(in_flight, "delete"):
+        in_flight.delete(request_hash)
+        return
     in_flight.pop(request_hash, None)
 
 
 def cleanup_in_flight(
-    in_flight: dict[str, float],
+    in_flight: Any,
     *,
     now: float | None = None,
     window_seconds: int = DUPLICATE_WINDOW_SECONDS,
@@ -80,11 +86,18 @@ def cleanup_in_flight(
     current = time.perf_counter() if now is None else now
     expired = [
         req_hash
-        for req_hash, started_at in list(in_flight.items())
+        for req_hash, started_at in (
+            in_flight.snapshot().items() if hasattr(in_flight, "snapshot") else in_flight.items()
+        )
         if (current - started_at) >= window_seconds
     ]
     for req_hash in expired:
-        in_flight.pop(req_hash, None)
+        if hasattr(in_flight, "delete"):
+            in_flight.delete(req_hash)
+            continue
+
+        if isinstance(in_flight, dict):
+            in_flight.pop(req_hash, None)
 
 
 def create_task_state(

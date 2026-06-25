@@ -71,8 +71,6 @@ async def native_keep_alive(model: str, keep_alive: int | str) -> dict[str, Any]
 async def unload_model(model: str) -> None:
     try:
         result = await native_keep_alive(model, 0)
-        reason = result.get("done_reason", "unknown")
-        print(f" 🧹 已請求卸載 {model} (done_reason={reason})")
     except Exception as exc:
         print(f" ⚠️ 卸載 {model} 失敗: {exc}")
 
@@ -98,7 +96,13 @@ async def chat_once(
         extra_body=extra_body,
         timeout=REQUEST_TIMEOUT,
     )
-    return response.choices[0].message.content or ""
+    if not getattr(response, "choices", None):
+        return "{}"
+
+    first_choice = response.choices[0]
+    message = getattr(first_choice, "message", None)
+    content = getattr(message, "content", None)
+    return content or "{}"
 
 
 async def chat_stream(
@@ -124,8 +128,13 @@ async def chat_stream(
         stream=True,
     )
 
+    yielded = False
     async for chunk in stream:
+        yielded = True
         yield chunk
+
+    if not yielded:
+        return
 
 
 def load_json(text: str, default: Any) -> Any:

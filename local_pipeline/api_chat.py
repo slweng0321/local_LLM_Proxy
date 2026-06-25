@@ -21,7 +21,7 @@ from .config import (
     TASK_PLANNER_MODEL,
 )
 from .db import save_task_state
-from .logging_utils import log_step
+from .logging_utils import log_heartbeat, log_stage_done, log_stage_start, log_stage_unload, log_step
 from .pipeline_agent import run_agent_pipeline_and_stream
 from .pipeline_common import cleanup_in_flight, is_duplicate_in_flight, load_json, mark_in_flight
 from .pipeline_plan import run_plan_pipeline_and_stream
@@ -37,7 +37,7 @@ from .retrieval import (
     simple_retrieve,
 )
 from .schemas import TaskState
-from .streaming import sse_response
+from .streaming import openai_chat_completion_final, openai_error_response, openai_json_response, openai_stream_response
 
 router = APIRouter()
 
@@ -67,6 +67,15 @@ def _default_file_plan() -> dict[str, Any]:
     }
 
 
+def _sse_model_error(message: str, code: str = "model_response_error"):
+    return openai_error_response(message, code=code)
+
+
+def _openai_json_response(content: str, *, model: str, task_id: str) -> JSONResponse:
+    payload = openai_json_response(content, chunk_id=f"chatcmpl-{task_id}", model=model)
+    return JSONResponse(payload)
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
@@ -79,6 +88,7 @@ async def chat_completions(request: Request):
     apply_mode = context["apply_mode"]
     effective_root = context["effective_root"]
     request_hash = context["request_hash"]
+    stream_requested = bool(body.get("stream", False))
 
     if not isinstance(messages, list) or not messages:
         return _error("messages is required", 400)
@@ -136,24 +146,34 @@ async def chat_completions(request: Request):
             temperature=0.2,
             options={"num_ctx": TASK_PLANNER_CTX},
         )
+        if not task_plan_text.strip() or task_plan_text.strip() == "{}":
+            return _sse_model_error(
+                f"TaskPlanner model {TASK_PLANNER_MODEL} returned an empty response.",
+                code="empty_task_planner_response",
+            )
         state.task_plan = load_json(task_plan_text, _default_task_plan(latest_user_content))
         await asyncio.to_thread(save_task_state, state)
 
         if AUTO_UNLOAD_AFTER_STAGE:
             await unload_model(TASK_PLANNER_MODEL)
+            log_stage_unload(TASK_PLANNER_MODEL)
 
         if state.task_plan.get("task_goal") == "__CHAT__":
-            async def direct_chat_iter():
-                stream = await chat_once(
-                    model=CHAT_MODEL,
-                    system=DIRECT_CHAT_SYSTEM,
-                    messages=[{"role": "user", "content": latest_user_content}],
-                    temperature=0.7,
-                    options={"num_ctx": TASK_PLANNER_CTX},
+            chat_stage_start = log_stage_start("💬 [Route]", CHAT_MODEL, "TaskPlanner 判定為簡易對話，切換到對話模型...")
+            direct = await chat_once(
+                model=CHAT_MODEL,
+                system=DIRECT_CHAT_SYSTEM,
+                messages=[{"role": "user", "content": latest_user_content}],
+                temperature=0.7,
+                options={"num_ctx": TASK_PLANNER_CTX},
+            )
+            log_stage_done("ChatModel", CHAT_MODEL, chat_stage_start)
+            if not direct.strip():
+                return _sse_model_error(
+                    f"Direct chat model {CHAT_MODEL} returned an empty response.",
+                    code="empty_direct_chat_response",
                 )
-                yield stream
-
-            return await sse_response(direct_chat_iter(), on_close=lambda: in_flight.delete(request_hash))
+            return _openai_json_response(direct, model=CHAT_MODEL, task_id=task_id)
 
         t = log_step(f"📋 [FilePlanner · {FILE_PLANNER_MODEL}] 規劃檔案操作...", time.perf_counter() - t)
         file_plan_text = await chat_once(
@@ -173,18 +193,24 @@ async def chat_completions(request: Request):
             temperature=0.2,
             options={"num_ctx": FILE_PLANNER_CTX},
         )
+        if not file_plan_text.strip() or file_plan_text.strip() == "{}":
+            return _sse_model_error(
+                f"FilePlanner model {FILE_PLANNER_MODEL} returned an empty response.",
+                code="empty_file_planner_response",
+            )
         state.file_plan = load_json(file_plan_text, _default_file_plan())
         await asyncio.to_thread(save_task_state, state)
 
         if AUTO_UNLOAD_AFTER_STAGE:
             await unload_model(FILE_PLANNER_MODEL)
+            log_stage_unload(FILE_PLANNER_MODEL)
 
         selected_paths = pick_selected_paths_from_file_plan(state.file_plan)
         selected_files = await asyncio.to_thread(read_selected_files, effective_root, selected_paths)
         selected_files_text = build_selected_files_text(selected_files)
 
         if pipeline_mode == "plan":
-            return await sse_response(
+            return openai_stream_response(
                 run_plan_pipeline_and_stream(
                     state=state,
                     latest_user_content=latest_user_content,
@@ -195,13 +221,31 @@ async def chat_completions(request: Request):
                     total_start=total_start,
                 ),
                 on_close=lambda: in_flight.delete(request_hash),
+                chunk_id=f"chatcmpl-{task_id}",
+                model=state.requested_model or requested_model or CHAT_MODEL,
             )
 
+        if pipeline_mode == "agent":
+            return openai_stream_response(
+                run_agent_pipeline_and_stream(
+                    state=state,
+                    latest_user_content=latest_user_content,
+                    selected_files_text=selected_files_text,
+                    request_hash=request_hash,
+                    in_flight=in_flight,
+                    total_start=total_start,
+                ),
+                on_close=lambda: in_flight.delete(request_hash),
+                chunk_id=f"chatcmpl-{task_id}",
+                model=state.requested_model or requested_model or CHAT_MODEL,
+            )
+
+        if not stream_requested:
+            return _openai_json_response(latest_user_content, model=state.requested_model or requested_model or CHAT_MODEL, task_id=task_id)
+
     except asyncio.CancelledError:
-        await in_flight.delete(request_hash)
         raise
     except Exception:
-        await in_flight.delete(request_hash)
         raise
 
 
